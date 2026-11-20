@@ -1,7 +1,13 @@
 .venv/
+
 __pycache__/
 .pytest_cache/
 *.egg-info/
+
 dist/
+
 oracle/target/
 oracle/Cargo.lock
+
+outputs
+.DS_Store
