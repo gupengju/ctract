@@ -473,7 +473,35 @@ def fit_blocks(target: np.ndarray, iters: int = 160, chunk: int = 25,
     for start in range(0, n_blocks, chunk):
         stop = min(start + chunk, n_blocks)
         m = stop - start
-        uu = torch.nn.Parameter(u0[start:stop].clone())
+        # random restarts: the envelope objective is rugged, so seed each block
+        # with the best of several random poses before touching Adam
+        m_ = stop - start
+        cands = [u0[start:stop].clone()]
+        for r in range(4):
+            cands.append(torch.randn(m_, len(FREE)) * 1.5)
+        with torch.no_grad():
+            losses = []
+            for cand in cands:
+                pose_c = to_pose(cand)
+                staged_c = torch.stack([pose_c, pose_c], 2).reshape(m_, -1, 17)
+                g_c = _model()[0](staged_c, mode="fit", temperature=0.05)
+                f0c = f0_t[start:stop][:, None]
+                phc = torch.remainder(ramp * f0c / SR + f0c * (BLOCK / 2) / SR, 1.0)
+                pulse_c = 1e-3 * glottal_shape(phc, torch.full_like(phc, 0.62),
+                                               torch.full_like(phc, 0.6),
+                                               torch.full_like(phc, 0.7))
+                out_c = _model()[1](pulse_c, g_c, BLOCK // 2, temperature=1e-5)
+                mid_c = out_c[:, BLOCK:2 * BLOCK]
+                gain_c = (mid_c * mid_ref[start:stop]).sum(1) \
+                    / (mid_c ** 2).sum(1).clamp(min=EPS)
+                amp_c = block_envelope(mid_c).clamp(min=EPS).log() \
+                    + gain_c.clamp(min=EPS).log()[:, None]
+                d_c = (ref[start:stop] - amp_c).abs() * weights[start:stop] * live[start:stop]
+                losses.append(d_c.sum(1) / live[start:stop].sum(1).clamp(min=1))
+            losses = torch.stack(losses)
+            pick = losses.argmin(0)
+            seed = torch.stack([cands[i][j] for j, i in enumerate(pick)])
+        uu = torch.nn.Parameter(seed)
         ss = torch.nn.Parameter(s0[start:stop].clone())
         noise = torch.randn(m, L, generator=torch.Generator().manual_seed(2024 + start))
         opt = torch.optim.Adam([uu, ss], lr=0.07)
@@ -558,9 +586,94 @@ def fit_blocks(target: np.ndarray, iters: int = 160, chunk: int = 25,
         "audio": audio.detach().numpy(),
         "flow": flow_full.detach(),
         "block_loss": loss_final,
+        "lam": 0.0,
         "data": float(loss_final.mean()),
         "history": [],
     }
+
+
+def polish_flow(target: np.ndarray, pose: torch.Tensor, flow0: torch.Tensor,
+                iters: int = 30, verbose: bool = True) -> torch.Tensor:
+    """Whole-sentence least squares on the excitation, exact line search.
+
+    The per-block solutions are found with the neighbours silent; rendered
+    together they interfere.  A few global steepest-descent steps fix that, and
+    they decrease the residual monotonically, so this stage can only help.
+    """
+    y = torch.tensor(target, dtype=torch.float32)
+    f = flow0.clone()
+    for k in range(iters):
+        r = y - render(pose, f).detach()
+        z = f.clone().requires_grad_(True)
+        out = render(pose, z)
+        g = torch.autograd.grad((out * r).sum(), z)[0]
+        Ag = render(pose, g).detach()
+        f = f + float((g * g).sum() / (Ag * Ag).sum().clamp(min=EPS)) * g
+        if verbose and (k + 1) % 10 == 0:
+            snr = 10 * np.log10(float((y ** 2).sum() / (((y - render(pose, f).detach()) ** 2).sum() + 1e-12)))
+            print(f"      polish {k + 1:3d}/{iters}  snr {snr:.2f} dB", flush=True)
+    return f
+
+
+def solve_flow_blocks(target: np.ndarray, pose: torch.Tensor, f0: np.ndarray,
+                      iters: int = 40, chunk: int = 25, verbose: bool = True) -> dict:
+    """Excitation by inverse filtering, one block at a time.
+
+    With the tract frozen, the renderer is linear in the excitation, so each
+    block solves `min_f ||A_t f - y_t||^2` by steepest descent with an exact
+    line search.  Every block gets its own excitation, so fricatives, bursts and
+    voicing all survive — this is what makes the resynthesis follow the
+    recording instead of only its vowel frames.
+    """
+    n_blocks = target.shape[0] // BLOCK
+    L = 3 * BLOCK
+    sig = torch.tensor(target, dtype=torch.float32)
+    padded = torch.nn.functional.pad(sig, (BLOCK, BLOCK))
+    windows = torch.stack([padded[i * BLOCK:(i + 3) * BLOCK] for i in range(n_blocks)])
+
+    flow_all = torch.zeros(n_blocks * BLOCK)
+    snr = np.zeros(n_blocks)
+    for start in range(0, n_blocks, chunk):
+        stop = min(start + chunk, n_blocks)
+        m = stop - start
+        pose_b = pose[start:stop].detach()
+        staged = torch.stack([pose_b, pose_b], 2).reshape(m, -1, 17)
+        g = _model()[0](staged, mode="fit", temperature=0.05)
+        renderer = _model()[1]
+
+        def fwd(f: torch.Tensor) -> torch.Tensor:
+            return renderer(f, g, BLOCK // 2, temperature=1e-5)
+
+        y = windows[start:stop]
+        f0b = torch.tensor(f0[start:stop])
+        ramp = torch.arange(L)[None].float()
+        phase = torch.remainder(ramp * f0b[:, None] / SR + f0b[:, None] * (BLOCK / 2) / SR, 1.0)
+        pulse = 1e-3 * glottal_shape(phase, torch.full_like(phase, 0.62),
+                                     torch.full_like(phase, 0.6),
+                                     torch.full_like(phase, 0.7))
+        f = pulse
+        a0 = fwd(f).detach()
+        f = f * ((a0 * y).sum(1) / (a0 * a0).sum(1).clamp(min=EPS))[:, None]
+        for k in range(iters):
+            r = y - fwd(f).detach()
+            z = f.clone().requires_grad_(True)
+            out = fwd(z)
+            gr = torch.autograd.grad((out * r).sum(), z)[0]
+            Ag = fwd(gr).detach()
+            step = ((gr * gr).sum(1) / (Ag * Ag).sum(1).clamp(min=EPS))[:, None]
+            f = f + step * gr
+        audio = fwd(f).detach()
+        mid_a = audio[:, BLOCK:2 * BLOCK].numpy()
+        mid_y = y[:, BLOCK:2 * BLOCK].numpy()
+        for i in range(m):
+            e = float((mid_y[i] ** 2).sum())
+            snr[start + i] = 10 * np.log10(max(e, 1e-12)
+                                           / max(1e-12, float(((mid_y[i] - mid_a[i]) ** 2).sum())))
+        flow_all[start * BLOCK:stop * BLOCK] = f[:, BLOCK:2 * BLOCK].reshape(-1)
+        if verbose:
+            print(f"      excitation blocks {start:3d}-{stop - 1:3d}  "
+                  f"median snr {np.median(snr[start:stop]):.1f} dB", flush=True)
+    return {"flow": flow_all, "block_snr": snr}
 
 
 def estimate_source(target: np.ndarray, pose: torch.Tensor, flow0: torch.Tensor,
@@ -605,7 +718,9 @@ def main() -> None:
     ap.add_argument("--no-source-fit", action="store_true", help="freeze the glottal source shape")
     ap.add_argument("--no-source-ls", action="store_true",
                     help="skip least-squares source estimation (parametric pulse only)")
-    ap.add_argument("--ls-iters", type=int, default=40)
+    ap.add_argument("--ls-iters", type=int, default=25)
+    ap.add_argument("--polish", type=int, default=30, help="global least-squares steps")
+    ap.add_argument("--chunk", type=int, default=25, help="blocks rendered in parallel")
     ap.add_argument("--threads", type=int, default=8)
     args = ap.parse_args()
 
@@ -623,20 +738,29 @@ def main() -> None:
     print(f"      {sr_in} Hz -> {SR:.0f} Hz, {n_blocks} blocks x {BLOCK / SR * 1000:.0f} ms "
           f"({n_blocks * BLOCK / SR:.2f} s)", flush=True)
 
-    print(f"[2/5] inverting trajectory ({len(FREE)} tract + 3 source controls per block)", flush=True)
-    result = fit(signal, args.lam, args.lam_src, args.iters, fit_source=not args.no_source_fit)
+    print(f"[2/5] inverting the tract, {len(FREE)} articulators per block", flush=True)
+    result = fit_blocks(signal, iters=args.iters, chunk=args.chunk)
     voiced = result["voiced"]
-    print(f"      voiced {int(voiced.sum())}/{n_blocks}  shape {result['data']:.4f}", flush=True)
+    print(f"      voiced {int(voiced.sum())}/{n_blocks}  band loss {result['data']:.4f}", flush=True)
 
     if args.no_source_ls:
-        print("[3/5] parametric pulse source only", flush=True)
+        print("[3/5] parametric pulse source", flush=True)
         audio = result["audio"].copy()
         snr = None
+        flow = result["flow"]
     else:
-        print("[3/5] least-squares excitation for the fitted tract", flush=True)
-        audio, snr = estimate_source(signal, result["pose"], result["flow"], args.ls_iters)
-        print(f"      waveform SNR {snr:.2f} dB", flush=True)
-        # the LS source already explains unvoiced blocks: no splicing needed
+        print("[3/5] inverse filtering the excitation, block by block", flush=True)
+        solved = solve_flow_blocks(signal, result["pose"], result["f0"],
+                                   iters=args.ls_iters, chunk=args.chunk)
+        flow = solved["flow"]
+        print("      assembling the blocks globally", flush=True)
+        flow = polish_flow(signal, result["pose"], flow, iters=args.polish)
+        denom = float((signal ** 2).sum())
+        audio = render(result["pose"], flow).detach().numpy()
+        snr = 10 * np.log10(denom / max(1e-12, float(((signal - audio) ** 2).sum())))
+        print(f"      median per-block snr {np.median(solved['block_snr']):.1f} dB, "
+              f"whole-sentence snr {snr:.2f} dB", flush=True)
+        snr = float(snr)
 
     wav_path = outdir / f"{stem}_resynth.wav"
     write_wav(wav_path, audio, SR)
@@ -644,8 +768,8 @@ def main() -> None:
     print("[4/5] scoring", flush=True)
     parametric = metrics(signal, result["audio"], voiced)
     hybrid = metrics(signal, audio, voiced)
-    print(f"      parametric: {parametric}", flush=True)
-    print(f"      hybrid    : {hybrid}", flush=True)
+    print(f"      parametric pulse source : {parametric}", flush=True)
+    print(f"      inverse-filtered source : {hybrid}", flush=True)
 
     pose = result["pose"].numpy()
     record = {
